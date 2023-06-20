@@ -11,6 +11,7 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/osquery/osquery-go v0.0.0-20230603132358-d2e851b3991b // indirect
 	github.com/pkg/errors v0.8.0 // indirect
+	github.com/stoewer/go-strcase v1.3.0 // indirect
 	golang.org/x/crypto v0.0.0-20200820211705-5c72a883971a // indirect
 	golang.org/x/net v0.0.0-20190620200207-3b0461eec859 // indirect
 	golang.org/x/sys v0.1.0 // indirect

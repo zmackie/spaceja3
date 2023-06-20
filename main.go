@@ -17,9 +17,9 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/google/gopacket/pcapgo"
 	"github.com/osquery/osquery-go"
 	"github.com/osquery/osquery-go/plugin/table"
+	"github.com/stoewer/go-strcase"
 )
 
 var debug bool
@@ -27,25 +27,40 @@ var debug bool
 var eventsMutex sync.Mutex
 var events []Record
 
+var (
+	socket     = flag.String("socket", "", "Path to the extensions UNIX domain socket")
+	timeout    = flag.Int("timeout", 3, "Seconds to wait for autoloaded extensions")
+	interval   = flag.Int("interval", 3, "Seconds delay between connectivity checks")
+	debug_flag = flag.Bool("debug", false, "debug mode")
+)
+
 func main() {
-	socket := flag.String("socket", "", "Path to osquery socket file")
-	debug_flag := flag.Bool("debug", false, "debug mode")
 	flag.Parse()
+	if *socket == "" {
+		log.Fatalln("Missing required --socket argument")
+	}
+	serverTimeout := osquery.ServerTimeout(
+		time.Second * time.Duration(*timeout),
+	)
+	serverPingInterval := osquery.ServerPingInterval(
+		time.Second * time.Duration(*interval),
+	)
 	debug = *debug_flag
 	if *socket == "" {
 		log.Fatalf(`Usage: %s --socket SOCKET_PATH`, os.Args[0])
 	}
 
-	server, err := osquery.NewExtensionManagerServer("foobar", *socket)
+	server, err := osquery.NewExtensionManagerServer("tls_fingerprints", *socket, serverTimeout, serverPingInterval)
 	if err != nil {
 		log.Fatalf("Error creating extension: %s\n", err)
 	}
 
+	go http_events()
+
 	// Create and register a new table plugin with the server.
 	// table.NewPlugin requires the table plugin name,
 	// a slice of Columns and a Generate function.
-	server.RegisterPlugin(table.NewPlugin("foobar", FoobarColumns(), FoobarGenerate))
-	go http_events()
+	server.RegisterPlugin(table.NewPlugin("tls_fingerprints", TLSSigsColumns(), TLSSigsGenerate))
 	if err := server.Run(); err != nil {
 		log.Fatalln(err)
 	}
@@ -56,7 +71,7 @@ type Record struct {
 	DestinationIP   string  `json,structs:"destination_ip"`
 	DestinationPort int     `json,structs:"destination_port"`
 	JA3             string  `json,structs:"ja3"`
-	JA3Digest       string  `json,structs:"ja3_digest"`
+	JA3_Digest      string  `json,structs:"ja3_digest"`
 	JA3S            string  `json,structs:"ja3s"`
 	JA3SDigest      string  `json,structs:"ja3s_digest"`
 	SourceIP        string  `json,structs:"source_ip"`
@@ -70,13 +85,13 @@ func (r Record) Map() map[string]string {
 	m := structs.Map(r)
 
 	for k, v := range m {
-		t[k] = fmt.Sprintf("%v", v)
+		t[strcase.SnakeCase(k)] = fmt.Sprintf("%v", v)
 	}
 	return t
 }
 
-// FoobarColumns returns the columns that our table will return.
-func FoobarColumns() []table.ColumnDefinition {
+// TLSSigsColumns returns the columns that our table will return.
+func TLSSigsColumns() []table.ColumnDefinition {
 	return []table.ColumnDefinition{
 		table.TextColumn("destination_ip"),
 		table.IntegerColumn("destination_port"),
@@ -90,14 +105,18 @@ func FoobarColumns() []table.ColumnDefinition {
 	}
 }
 
-// FoobarGenerate will be called whenever the table is queried. It should return
+// TLSSigsGenerate will be called whenever the table is queried. It should return
 // a full table scan.
-func FoobarGenerate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
+func TLSSigsGenerate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
 	eventsJson := []map[string]string{}
 	eventsMutex.Lock()
 	defer eventsMutex.Unlock()
 	for _, r := range events {
 		eventsJson = append(eventsJson, r.Map())
+	}
+
+	if debug {
+		fmt.Println("queried for events", eventsJson)
 	}
 	return eventsJson, nil
 }
@@ -124,7 +143,10 @@ func http_events() {
 		}
 		eventsMutex.Lock()
 		events = append(events, ja3Record)
-		defer eventsMutex.Unlock()
+		eventsMutex.Unlock()
+		if debug {
+			fmt.Println("new event", events[len(events)-1])
+		}
 
 	}
 
@@ -144,15 +166,13 @@ func do_cap(cbChan chan Record, iface string, ja3s bool, snaplen int, promisc bo
 	// 	}
 	// }
 
-	var pcapWriter *pcapgo.Writer
-
 	count := 0
 	for {
 		// read packet data
 		data, ci, err := h.ReadPacketData()
-		if debug {
-			fmt.Println("packet data", data[0:10])
-		}
+		// if debug {
+		// 	fmt.Println("packet data", data[0:10])
+		// }
 		if err == io.EOF {
 			if debug {
 				fmt.Println(count, "fingerprints.")
@@ -178,10 +198,6 @@ func do_cap(cbChan chan Record, iface string, ja3s bool, snaplen int, promisc bo
 		// check if we got a result
 		if len(bare) > 0 {
 			count++
-
-			if pcapWriter != nil {
-				pcapWriter.WritePacket(ci, data)
-			}
 
 			var (
 				// b  strings.Builder
@@ -211,7 +227,7 @@ func do_cap(cbChan chan Record, iface string, ja3s bool, snaplen int, promisc bo
 				r.JA3SDigest = digest
 			} else {
 				r.JA3 = string(bare)
-				r.JA3Digest = digest
+				r.JA3_Digest = digest
 			}
 			cbChan <- r
 		}
