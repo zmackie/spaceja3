@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dreadl0ck/ja3"
+	"github.com/fatih/structs"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
@@ -22,6 +23,9 @@ import (
 )
 
 var debug bool
+
+var eventsMutex sync.Mutex
+var events []Record
 
 func main() {
 	socket := flag.String("socket", "", "Path to osquery socket file")
@@ -47,50 +51,71 @@ func main() {
 	}
 }
 
+// // Record contains all information for a calculated JA3
+type Record struct {
+	DestinationIP   string  `json,structs:"destination_ip"`
+	DestinationPort int     `json,structs:"destination_port"`
+	JA3             string  `json,structs:"ja3"`
+	JA3Digest       string  `json,structs:"ja3_digest"`
+	JA3S            string  `json,structs:"ja3s"`
+	JA3SDigest      string  `json,structs:"ja3s_digest"`
+	SourceIP        string  `json,structs:"source_ip"`
+	SourcePort      int     `json,structs:"source_port"`
+	Timestamp       float64 `json,structs:"timestamp"`
+}
+
+func (r Record) Map() map[string]string {
+	t := map[string]string{}
+
+	m := structs.Map(r)
+
+	for k, v := range m {
+		t[k] = fmt.Sprintf("%v", v)
+	}
+	return t
+}
+
 // FoobarColumns returns the columns that our table will return.
 func FoobarColumns() []table.ColumnDefinition {
 	return []table.ColumnDefinition{
-		table.TextColumn("foo"),
-		table.TextColumn("baz"),
+		table.TextColumn("destination_ip"),
+		table.IntegerColumn("destination_port"),
+		table.TextColumn("ja3"),
+		table.TextColumn("ja3_digest"),
+		table.TextColumn("ja3s"),
+		table.TextColumn("ja3s_digest"),
+		table.TextColumn("source_ip"),
+		table.IntegerColumn("source_port"),
+		table.DoubleColumn("timestamp"),
 	}
 }
 
 // FoobarGenerate will be called whenever the table is queried. It should return
 // a full table scan.
 func FoobarGenerate(ctx context.Context, queryContext table.QueryContext) ([]map[string]string, error) {
-	return []map[string]string{
-		{
-			"foo": "bar",
-			"baz": "baz",
-		},
-		{
-			"foo": "bar",
-			"baz": "baz",
-		},
-	}, nil
+	eventsJson := []map[string]string{}
+	eventsMutex.Lock()
+	defer eventsMutex.Unlock()
+	for _, r := range events {
+		eventsJson = append(eventsJson, r.Map())
+	}
+	return eventsJson, nil
 }
-
-type ja3Sig struct {
-	Name string
-}
-
-var eventsMutex sync.Mutex
-var events []ja3.Record
 
 func http_events() {
 	//# Event loop that does pcap
 	//# sends ja3/ja3s hashes to a channelcontext
 	//# channel retrieves them when table is looked up
-	ifaces, err := pcap.FindAllDevs()
-	if err != nil {
-		log.Fatalf("Failed to get network interfaces: %v", err)
-	}
-	ja3Chan := make(chan ja3.Record)
-	for _, iface := range ifaces {
-		fmt.Println(iface)
-		u, _ := time.ParseDuration(".1s")
-		go do_cap(ja3Chan, iface.Name, true, 0, true, u)
-	}
+	// ifaces, err := pcap.FindAllDevs()
+	// if err != nil {
+	// 	log.Fatalf("Failed to get network interfaces: %v", err)
+	// }
+	ja3Chan := make(chan Record)
+	// for _, iface := range ifaces {
+	// 	fmt.Println(iface)
+	// u, _ := time.ParseDuration("1s")
+	go do_cap(ja3Chan, "eth0", true, 0, true, pcap.BlockForever)
+	// }
 
 	for {
 		ja3Record, ok := <-ja3Chan
@@ -98,15 +123,15 @@ func http_events() {
 			return
 		}
 		eventsMutex.Lock()
-		defer eventsMutex.Unlock()
 		events = append(events, ja3Record)
+		defer eventsMutex.Unlock()
 
 	}
 
 }
 
 // taken from https://github.com/dreadl0ck/ja3/blob/master/live.go
-func do_cap(cbChan chan ja3.Record, iface string, ja3s bool, snaplen int, promisc bool, timeout time.Duration) {
+func do_cap(cbChan chan Record, iface string, ja3s bool, snaplen int, promisc bool, timeout time.Duration) {
 	h, err := pcap.OpenLive(iface, int32(snaplen), promisc, timeout)
 	if err != nil {
 		panic(err)
@@ -125,13 +150,17 @@ func do_cap(cbChan chan ja3.Record, iface string, ja3s bool, snaplen int, promis
 	for {
 		// read packet data
 		data, ci, err := h.ReadPacketData()
+		if debug {
+			fmt.Println("packet data", data[0:10])
+		}
 		if err == io.EOF {
 			if debug {
 				fmt.Println(count, "fingerprints.")
 			}
 			return
 		} else if err != nil {
-			panic(err)
+			fmt.Println("error reading packets:", err)
+			return
 		}
 
 		var (
@@ -168,7 +197,7 @@ func do_cap(cbChan chan ja3.Record, iface string, ja3s bool, snaplen int, promis
 				continue
 			}
 
-			r := &ja3.Record{
+			r := Record{
 				DestinationIP:   nl.NetworkFlow().Dst().String(),
 				DestinationPort: int(binary.BigEndian.Uint16(tl.TransportFlow().Dst().Raw())),
 				SourceIP:        nl.NetworkFlow().Src().String(),
@@ -184,7 +213,7 @@ func do_cap(cbChan chan ja3.Record, iface string, ja3s bool, snaplen int, promis
 				r.JA3 = string(bare)
 				r.JA3Digest = digest
 			}
-			cbChan <- *r
+			cbChan <- r
 		}
 	}
 }

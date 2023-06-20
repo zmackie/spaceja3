@@ -7,6 +7,7 @@ require (
 	github.com/apache/thrift v0.16.0 // indirect
 	github.com/dreadl0ck/ja3 v1.0.4 // indirect
 	github.com/dreadl0ck/tlsx v1.0.1-google-gopacket // indirect
+	github.com/fatih/structs v1.1.0 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/osquery/osquery-go v0.0.0-20230603132358-d2e851b3991b // indirect
 	github.com/pkg/errors v0.8.0 // indirect
