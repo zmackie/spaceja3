@@ -3,14 +3,12 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,9 +21,13 @@ import (
 	"github.com/osquery/osquery-go/plugin/table"
 )
 
+var debug bool
+
 func main() {
 	socket := flag.String("socket", "", "Path to osquery socket file")
+	debug_flag := flag.Bool("debug", false, "debug mode")
 	flag.Parse()
+	debug = *debug_flag
 	if *socket == "" {
 		log.Fatalf(`Usage: %s --socket SOCKET_PATH`, os.Args[0])
 	}
@@ -39,13 +41,7 @@ func main() {
 	// table.NewPlugin requires the table plugin name,
 	// a slice of Columns and a Generate function.
 	server.RegisterPlugin(table.NewPlugin("foobar", FoobarColumns(), FoobarGenerate))
-	ifaces, err := pcap.FindAllDevs()
-	if err != nil {
-		log.Fatalf("Failed to get network interfaces: %v", err)
-	}
-	for _, iface := range ifaces {
-		go spawn_caps(iface.Name)
-	}
+	go http_events()
 	if err := server.Run(); err != nil {
 		log.Fatalln(err)
 	}
@@ -74,32 +70,43 @@ func FoobarGenerate(ctx context.Context, queryContext table.QueryContext) ([]map
 	}, nil
 }
 
-func spawn_caps(iface string) {
-	// loop through interfaces
-	// spawn a capture for each interface
-	fmt.Println(iface)
-	ja3.ReadInterface(iface, "", "")
-	http_events(iface)
-}
-
 type ja3Sig struct {
 	Name string
 }
 
 var eventsMutex sync.Mutex
-var events []ja3Sig
+var events []ja3.Record
 
-func http_events(i string) {
+func http_events() {
 	//# Event loop that does pcap
 	//# sends ja3/ja3s hashes to a channelcontext
 	//# channel retrieves them when table is looked up
-	eventsMutex.Lock()
-	defer eventsMutex.Unlock()
-	events = append(events, ja3Sig{Name: i})
+	ifaces, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Fatalf("Failed to get network interfaces: %v", err)
+	}
+	ja3Chan := make(chan ja3.Record)
+	for _, iface := range ifaces {
+		fmt.Println(iface)
+		u, _ := time.ParseDuration(".1s")
+		go do_cap(ja3Chan, iface.Name, true, 0, true, u)
+	}
+
+	for {
+		ja3Record, ok := <-ja3Chan
+		if !ok {
+			return
+		}
+		eventsMutex.Lock()
+		defer eventsMutex.Unlock()
+		events = append(events, ja3Record)
+
+	}
+
 }
 
 // taken from https://github.com/dreadl0ck/ja3/blob/master/live.go
-func do_cap() (iface string, ja3s bool, asJSON bool, snaplen int, promisc bool, timeout time.Duration) {
+func do_cap(cbChan chan ja3.Record, iface string, ja3s bool, snaplen int, promisc bool, timeout time.Duration) {
 	h, err := pcap.OpenLive(iface, int32(snaplen), promisc, timeout)
 	if err != nil {
 		panic(err)
@@ -112,7 +119,6 @@ func do_cap() (iface string, ja3s bool, asJSON bool, snaplen int, promisc bool, 
 	// 	}
 	// }
 
-	var dumpFileHandle *os.File
 	var pcapWriter *pcapgo.Writer
 
 	count := 0
@@ -120,9 +126,9 @@ func do_cap() (iface string, ja3s bool, asJSON bool, snaplen int, promisc bool, 
 		// read packet data
 		data, ci, err := h.ReadPacketData()
 		if err == io.EOF {
-			// if Debug {
-			// 	fmt.Println(count, "fingerprints.")
-			// }
+			if debug {
+				fmt.Println(count, "fingerprints.")
+			}
 			return
 		} else if err != nil {
 			panic(err)
@@ -149,16 +155,16 @@ func do_cap() (iface string, ja3s bool, asJSON bool, snaplen int, promisc bool, 
 			}
 
 			var (
-				b  strings.Builder
+				// b  strings.Builder
 				nl = p.NetworkLayer()
 				tl = p.TransportLayer()
 			)
 
 			// got a bare but no transport or network layer
 			if tl == nil || nl == nil {
-				// if Debug {
-				// 	fmt.Println("got a nil layer: ", nl, tl, p.Dump(), string(bare))
-				// }
+				if debug {
+					fmt.Println("got a nil layer: ", nl, tl, p.Dump(), string(bare))
+				}
 				continue
 			}
 
@@ -178,28 +184,7 @@ func do_cap() (iface string, ja3s bool, asJSON bool, snaplen int, promisc bool, 
 				r.JA3 = string(bare)
 				r.JA3Digest = digest
 			}
-
-			if asJSON {
-
-				// make it pretty please
-				b, err := json.MarshalIndent(r, "", "    ")
-				if err != nil {
-					panic(err)
-				}
-
-				if string(b) != "null" { // no matches will result in "null" json
-					// write to output io.Writer
-					_, err = out.Write(b)
-					if err != nil {
-						panic(err)
-					}
-
-					_, err = out.Write([]byte("\n"))
-					if err != nil {
-						panic(err)
-					}
-				}
-			}
+			cbChan <- *r
 		}
 	}
 }
